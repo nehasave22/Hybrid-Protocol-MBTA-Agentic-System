@@ -559,43 +559,7 @@ mbta-agentcy/
 
 ---
 
-## 🎓 **Research Contributions**
 
-This project demonstrates:
-
-1. **First working hybrid MCP+A2A system** with measured performance gains
-2. **Intelligent protocol routing** based on query complexity analysis
-3. **Semantic agent discovery** via NANDA registry integration
-4. **Production-grade observability** for distributed agent systems
-5. **Early implementation** of emerging protocols (NANDA, AGNTCY, MCP)
-
-
-
----
-
-## 📖 **Documentation**
-
-- **Architecture Details:** See `docs/ARCHITECTURE.md`
-- **Deployment Guide:** See `docs/DEPLOYMENT.md`
-- **API Reference:** See `docs/API.md`
-- **Gap Analysis:** See `docs/gaps_analysis.md`
-
----
-
-## 🤝 **Acknowledgments**
-
-**Frameworks & Protocols:**
-- **NANDA** (MIT Media Lab) - Index architecture, AgentFacts schema, ZTAA framework
-- **AGNTCY** (Cisco Outshift) - Agent Directory Service, SLIM protocol, OASF
-- **Anthropic** - Model Context Protocol (MCP)
-- **Google/Linux Foundation** - Agent-to-Agent (A2A) protocol
-
-**Research Papers:**
-- "Beyond DNS: Unlocking the Internet of AI Agents via the NANDA Index" (arXiv:2507.14263)
-- "Using the NANDA Index Architecture in Practice" (arXiv:2508.03101)
-- "The AGNTCY Agent Directory Service" (arXiv:2509.18787)
-
----
 
 
 
