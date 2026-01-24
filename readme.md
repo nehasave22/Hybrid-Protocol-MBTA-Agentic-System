@@ -426,21 +426,6 @@ linode-cli linodes delete <ID4>
 
 ---
 
-## 💰 **Cost Estimate**
-
-**Monthly costs (approximate):**
-- Exchange Server (4GB): $24/month
-- Agents Server (4GB): $24/month
-- Registry Server (4GB): $24/month
-- Observability Server (4GB): $24/month
-- **Total Infrastructure:** ~$96/month
-
-**API costs (at 1M queries/month):**
-- OpenAI embeddings: ~$20
-- OpenAI LLM calls: ~$30
-- **Total API:** ~$50/month
-
-**Grand Total:** ~$100/month for 1 million queries
 
 ---
 
@@ -654,6 +639,3 @@ linode-cli linodes list
 linode-cli linodes delete <INSTANCE_ID>
 ```
 
----
-
-**Built with ❤️ at Northeastern University | December 2025**
