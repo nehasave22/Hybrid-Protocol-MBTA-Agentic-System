@@ -15,12 +15,7 @@ MBTA Agentcy demonstrates **hybrid protocol orchestration** by combining:
 - **NANDA/Google's A2A** (Agent-to-Agent) for complex multi-agent coordination
 - **Intelligent LLM routing** that achieves **25x performance improvement**
 
-**Key Results:**
-- 🚀 **400ms** response time for simple queries (MCP path)
-- 🤝 **1500ms** for complex multi-agent coordination (A2A path)
-- 🎯 **95% accuracy** in intent classification
-- 💰 **$0.00002-$0.0003** cost per query
-- 🏙️ Serving **141 MBTA stations** in production
+
 
 ---
 
