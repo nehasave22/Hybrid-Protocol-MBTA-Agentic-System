@@ -3,7 +3,8 @@
 
 Production-grade distributed multi-agent system serving Boston's MBTA network with intelligent MCP+A2A protocol orchestration.
 
-<img width="1405" height="836" alt="image" src="https://github.com/user-attachments/assets/c8a75ab1-1041-4d73-b815-4523784cf5ff" />
+<img width="1432" height="889" alt="image" src="https://github.com/user-attachments/assets/415f47ae-03fb-437f-a461-7babe567295a" />
+
 
 ---
 
