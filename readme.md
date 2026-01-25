@@ -1,4 +1,4 @@
-# MBTA Agentcy
+# MBTA Winter 2026
 ## Hybrid Protocol Transit Intelligence System
 
 Production-grade distributed multi-agent system serving Boston's MBTA network with intelligent MCP+A2A protocol orchestration.
