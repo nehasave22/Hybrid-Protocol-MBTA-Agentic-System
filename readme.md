@@ -1,22 +1,18 @@
 # MBTA Winter 2026
 ## Hybrid Protocol Transit Intelligence System
-A Distributed multi-agent system serving Boston's MBTA network with intelligent MCP+A2A protocol orchestration, Federation of Registries
+A Distributed multi-agent system serving Boston's MBTA network with intelligent MCP+A2A protocol orchestration via SLIM transport and NANDA Registry Federation
 
 <img width="1206" height="829" alt="image" src="https://github.com/user-attachments/assets/ec898cb6-2178-4caa-bd17-2ffba024e21d" />
-
-
-
 
 ---
 
 ## 🎯 **What This Is**
 
-MBTA winter 2026 demonstrates **hybrid protocol orchestration** by combining:
-- **Anthropic's MCP** (Model Context Protocol) for fast, single-tool queries
-- **NANDA/Google's A2A** (Agent-to-Agent) for complex multi-agent coordination
-- **Intelligent LLM routing** that achieves **25x performance improvement**
-
-
+MBTA Winter 2026 demonstrates **hybrid protocol orchestration** by combining:
+- **Anthropic's MCP** (Model Context Protocol) for fast, single-tool queries (~400ms)
+- **NANDA/Google's A2A** (Agent-to-Agent) for complex multi-agent coordination (~1500ms)
+- **Cisco's SLIM** (Semantic Language Interface for Multi-agent) transport for standardized A2A communication
+- **Intelligent LLM routing** that achieves **25x performance improvement** for simple queries
 
 ---
 
@@ -32,14 +28,19 @@ MBTA winter 2026 demonstrates **hybrid protocol orchestration** by combining:
                              │         │
                     ┌────────┘         └────────┐
                     ▼                           ▼
-            ┌──────────────┐          ┌─────────────────┐
-            │  MCP Client  │          │ A2A Agents      │
-            │  (stdio)     │          │ (Port 8001-8003)│
-            │              │          │                 │
-            │ 32 MBTA Tools│          │ • Alerts        │
-            │ 400ms resp.  │          │ • Planner       │
-            └──────────────┘          │ • StopFinder    │
-                                      └─────────────────┘
+            ┌──────────────┐          ┌─────────────────────┐
+            │  MCP Client  │          │ SLIM A2A Transport  │
+            │  (stdio)     │          │ (gRPC on ports      │
+            │              │          │  50051-50053)       │
+            │ 32 MBTA Tools│          │                     │
+            │ 400ms resp.  │          │ ┌─────────────────┐ │
+            └──────────────┘          │ │ A2A Agents      │ │
+                                      │ │ • Alerts        │ │
+                                      │ │ • Planner       │ │
+                                      │ │ • StopFinder    │ │
+                                      │ │ (Port 8001-8003)│ │
+                                      │ └─────────────────┘ │
+                                      └─────────────────────┘
                                       
 ┌─────────────────────────────────────────────────────────┐
 │  Observability Stack                                    │
@@ -49,10 +50,10 @@ MBTA winter 2026 demonstrates **hybrid protocol orchestration** by combining:
 ```
 
 **4-Server Deployment:**
-1. **Exchange Server** - Protocol gateway, frontend UI
-2. **Agents Server** - 3 specialized A2A agents
-3. **Registry Server** - NANDA agent discovery
-4. **Observability Server** - Distributed tracing & analytics
+1. **Exchange Server** - Protocol gateway, intelligent routing, frontend UI
+2. **Agents Server** - 3 specialized A2A agents (SLIM enabled)
+3. **Registry Server** - NANDA agent discovery and semantic agent lookup
+4. **Observability Server** - Distributed tracing, metrics, analytics
 
 ---
 
@@ -71,7 +72,7 @@ linode-cli configure
 - OpenAI API Key: Get from https://platform.openai.com/
 
 3. **Time Required**
-- Total: ~30-40 minutes for all 4 servers
+- Total: ~40 minutes for all 4 servers
 - Per server: ~8-10 minutes
 
 ---
@@ -89,6 +90,7 @@ bash deploy_registry_with_ui.sh
 - Installs MongoDB
 - Deploys registry API (port 6900)
 - Deploys registry UI dashboard
+- Enables semantic agent discovery
 
 **Save this info from output:**
 ```
@@ -99,7 +101,7 @@ Dashboard: http://XXX.XXX.XXX.XXX
 
 ---
 
-### Step 2: Deploy MBTA Agents (8-10 min)
+### Step 2: Deploy MBTA Agents with SLIM Transport (8-10 min)
 
 ```bash
 bash deploy-agents-only.sh "YOUR_MBTA_API_KEY" "YOUR_OPENAI_API_KEY"
@@ -111,16 +113,21 @@ bash deploy-agents-only.sh "YOUR_MBTA_API_KEY" "YOUR_OPENAI_API_KEY"
 
 **What it does:**
 - Creates Linode instance
-- Deploys 3 A2A agents:
-  - Alerts Agent (port 8001)
-  - Planner Agent (port 8002)
-  - StopFinder Agent (port 8003)
+- Installs agntcy-app-sdk and a2a-sdk (SLIM support)
+- Deploys 3 A2A agents with SLIM servers:
+  - Alerts Agent (HTTP on 8001 + SLIM on 50051)
+  - Planner Agent (HTTP on 8002 + SLIM on 50052)
+  - StopFinder Agent (HTTP on 8003 + SLIM on 50053)
+- Configures both HTTP (fallback) and SLIM (primary) transports
 
 **Save this info from output:**
 ```
 Agents IP: XXX.XXX.XXX.XXX
 Password: <save this>
 SSH Key: mbta-agents-key
+
+SLIM Ports: 50051, 50052, 50053
+HTTP Ports: 8001, 8002, 8003 (fallback)
 ```
 
 ---
@@ -138,15 +145,21 @@ bash deploy-exchange-only.sh "YOUR_OPENAI_API_KEY" "YOUR_MBTA_API_KEY" "AGENTS_I
 
 **What it does:**
 - Creates Linode instance
+- Installs agntcy-app-sdk (SLIM client support)
 - Deploys Exchange Agent (port 8100)
+  - Intelligent routing (MCP vs A2A)
+  - SLIM client for calling agents
+  - Query decomposition for multi-agent coordination
 - Deploys Frontend UI (port 3000)
-- Connects to agents server
+- Connects to agents server via SLIM transport
 
 **Save this info from output:**
 ```
 Exchange IP: XXX.XXX.XXX.XXX
 Password: <save this>
 SSH Key: mbta-exchange-key
+
+USE_SLIM=true (environment variable set)
 ```
 
 ---
@@ -164,12 +177,16 @@ bash deploy-observability.sh
   - Grafana (port 3001)
   - ClickHouse (port 8123)
   - OTEL Collector (port 4317)
+- Configures SLIM trace export (OTLP gRPC)
 
 **Save this info from output:**
 ```
 Observability IP: XXX.XXX.XXX.XXX
 Password: <save this>
 SSH Key: mbta-observability-key
+
+OTEL gRPC: 4317
+OTEL HTTP: 4318
 ```
 
 **Configure Exchange & Agents to send traces:**
@@ -204,7 +221,7 @@ exit
 # Edit register_agents.sh first
 # Replace IP addresses with your actual IPs:
 # REGISTRY_URL="http://YOUR_REGISTRY_IP:6900"
-# agent_url: "http://YOUR_AGENTS_IP:8001"
+# agent_url: "http://YOUR_AGENTS_IP:8001" (HTTP endpoint for registry)
 
 # Then run:
 bash register_agents.sh
@@ -212,7 +229,8 @@ bash register_agents.sh
 
 **What it does:**
 - Registers 3 agents with semantic descriptions
-- Enables dynamic agent discovery
+- Enables dynamic agent discovery via NANDA registry
+- Exchange Agent discovers agents at runtime (not hardcoded)
 - Sets agent status to "alive"
 
 ---
@@ -225,7 +243,7 @@ bash register_agents.sh
 # Registry
 curl http://REGISTRY_IP:6900/health
 
-# Agents
+# Agents (HTTP endpoints)
 curl http://AGENTS_IP:8001/health
 curl http://AGENTS_IP:8002/health
 curl http://AGENTS_IP:8003/health
@@ -241,7 +259,37 @@ curl http://OBSERVABILITY_IP:16686
 
 ---
 
-### Test 2: Send a Query (MCP Fast Path)
+### Test 2: Verify SLIM Agents Running
+
+```bash
+# SSH to agents server
+ssh -i mbta-agents-key root@AGENTS_IP
+
+# Check SLIM services
+sudo supervisorctl status | grep slim
+
+# Should show:
+# mbta-alerts-slim    RUNNING
+# mbta-planner-slim   RUNNING
+# mbta-stopfinder-slim RUNNING
+```
+
+---
+
+### Test 3: Test SLIM Transport
+
+```bash
+# Check if SLIM agents are responding
+curl http://AGENTS_IP:50051/.well-known/agent-card.json
+curl http://AGENTS_IP:50052/.well-known/agent-card.json
+curl http://AGENTS_IP:50053/.well-known/agent-card.json
+
+# Should return AgentCard JSON with capabilities
+```
+
+---
+
+### Test 4: Send a Query (MCP Fast Path)
 
 ```bash
 curl -X POST http://EXCHANGE_IP:8100/chat \
@@ -256,13 +304,16 @@ curl -X POST http://EXCHANGE_IP:8100/chat \
   "path": "mcp",
   "latency_ms": 400,
   "intent": "alerts",
-  "confidence": 0.95
+  "confidence": 0.95,
+  "metadata": {
+    "tools_used": ["mbta_get_alerts"]
+  }
 }
 ```
 
 ---
 
-### Test 3: Send Complex Query (A2A Path)
+### Test 5: Send Complex Query (A2A Path via SLIM)
 
 ```bash
 curl -X POST http://EXCHANGE_IP:8100/chat \
@@ -279,14 +330,17 @@ curl -X POST http://EXCHANGE_IP:8100/chat \
   "intent": "trip_planning",
   "confidence": 0.95,
   "metadata": {
-    "agents_called": ["mbta-route-planner"]
+    "agents_called": ["mbta-route-planner"],
+    "transport": "slim"
   }
 }
 ```
 
+**The agents_called field shows SLIM was used to communicate.**
+
 ---
 
-### Test 4: Open Web UI
+### Test 6: Open Web UI
 
 ```
 http://EXCHANGE_IP:3000
@@ -295,11 +349,11 @@ http://EXCHANGE_IP:3000
 **You should see:**
 - Chat interface
 - Real-time responses
-- System internals panel showing routing decisions
+- System internals panel showing routing decisions and transport used
 
 ---
 
-### Test 5: View Distributed Traces
+### Test 7: View Distributed Traces (Including SLIM Spans)
 
 ```
 http://OBSERVABILITY_IP:16686
@@ -308,10 +362,11 @@ http://OBSERVABILITY_IP:16686
 **In Jaeger UI:**
 1. Select service: `exchange-agent`
 2. Click "Find Traces"
-3. You should see traces showing:
-   - MCP fast path (single span)
-   - A2A orchestration (multiple spans)
-   - Timing breakdowns
+3. Open an A2A trace (1500ms+)
+4. You should see spans including:
+   - `slim_client.call_agent` (SLIM transport timing)
+   - `agent_response_extraction` (parsing response)
+   - Individual agent processing times
 
 ---
 
@@ -323,10 +378,15 @@ After deployment, save these URLs:
 Frontend UI:        http://EXCHANGE_IP:3000
 Exchange API:       http://EXCHANGE_IP:8100
 
-MBTA Agents:
+MBTA Agents (HTTP):
   Alerts:           http://AGENTS_IP:8001
   Planner:          http://AGENTS_IP:8002
   StopFinder:       http://AGENTS_IP:8003
+
+MBTA Agents (SLIM):
+  Alerts:           grpc://AGENTS_IP:50051
+  Planner:          grpc://AGENTS_IP:50052
+  StopFinder:       grpc://AGENTS_IP:50053
 
 NANDA Registry:
   Dashboard:        http://REGISTRY_IP
@@ -358,6 +418,44 @@ tail -f /var/log/mbta-*.log
 supervisorctl restart all
 ```
 
+### SLIM Agents Not Running?
+
+```bash
+# SSH to agents server
+ssh -i mbta-agents-key root@AGENTS_IP
+
+# Check SLIM service status
+supervisorctl status mbta-alerts-slim
+supervisorctl status mbta-planner-slim
+supervisorctl status mbta-stopfinder-slim
+
+# View SLIM logs
+tail -50 /var/log/mbta-alerts-slim.err.log
+tail -50 /var/log/mbta-planner-slim.err.log
+tail -50 /var/log/mbta-stopfinder-slim.err.log
+
+# If not running, restart
+supervisorctl restart mbta-alerts-slim mbta-planner-slim mbta-stopfinder-slim
+```
+
+### SLIM Client Connection Issues?
+
+```bash
+# SSH to exchange server
+ssh -i mbta-exchange-key root@EXCHANGE_IP
+
+# Check if USE_SLIM is enabled
+cat /opt/mbta-agentcy/.env | grep USE_SLIM
+# Should show: USE_SLIM=true
+
+# Check exchange logs for SLIM errors
+tail -100 /var/log/mbta-exchange.err.log | grep -i slim
+
+# Verify can reach SLIM agents
+curl -v grpc://AGENTS_IP:50051/
+# (gRPC connections won't respond like HTTP, but firewall should allow)
+```
+
 ### MCP Client Issues?
 
 ```bash
@@ -380,8 +478,10 @@ curl http://REGISTRY_IP:6900/list
 # Re-register
 bash register_agents.sh
 
-# Verify
+# Verify each agent
 curl http://REGISTRY_IP:6900/agents/mbta-alerts
+curl http://REGISTRY_IP:6900/agents/mbta-planner
+curl http://REGISTRY_IP:6900/agents/mbta-stopfinder
 ```
 
 ### No Traces in Jaeger?
@@ -428,6 +528,18 @@ linode-cli linodes delete <ID4>
 ---
 
 
+
+### Key Files for SLIM Implementation
+
+**Exchange Agent (Client):**
+- `/opt/mbta-agentcy/src/exchange_agent/slim_client.py` - Creates SLIM clients
+- `/opt/mbta-agentcy/src/exchange_agent/stategraph_orchestrator.py` - Uses SLIM for A2A calls
+
+**Agent Servers (Servers):**
+- `/opt/mbta-agents/agents/alerts/slim_wrapper.py` - SLIM-enabled alerts agent
+- `/opt/mbta-agents/agents/planner/slim_wrapper.py` - SLIM-enabled planner agent
+- `/opt/mbta-agents/agents/stopfinder/slim_wrapper.py` - SLIM-enabled stopfinder agent
+
 ---
 
 ## 🔧 **Local Development (Optional)**
@@ -435,14 +547,14 @@ linode-cli linodes delete <ID4>
 ### Run Locally Without Deployment
 
 **Requirements:**
-- Python 3.11+
+- Python 3.12+
 - Docker Desktop (for observability)
 
 **Setup:**
 
 ```bash
 # 1. Create virtual environment
-python3.11 -m venv venv
+python3.12 -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # 2. Install dependencies
@@ -452,18 +564,24 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and add your API keys
 
-# 4. Start observability (optional)
+# 4. Install SLIM SDKs
+pip install agntcy-app-sdk a2a-sdk
+
+# 5. Set SLIM mode
+echo "USE_SLIM=true" >> .env
+
+# 6. Start observability (optional)
 docker compose -f docker-compose-observability.yml up -d
 
-# 5. Run agents (in separate terminals)
-python -m agents.alerts.main
-python -m agents.planner.main
-python -m agents.stopfinder.main
+# 7. Run agents with SLIM (in separate terminals)
+python -m agents.alerts.slim_wrapper
+python -m agents.planner.slim_wrapper
+python -m agents.stopfinder.slim_wrapper
 
-# 6. Run exchange agent
+# 8. Run exchange agent (uses SLIM client)
 python -m src.exchange_agent.exchange_server
 
-# 7. Run frontend
+# 9. Run frontend
 python -m src.frontend.chat_server
 ```
 
@@ -482,12 +600,19 @@ mbta-agentcy/
 │   ├── exchange_agent/          # Protocol gateway & intelligent routing
 │   │   ├── exchange_server.py   # Main FastAPI server
 │   │   ├── mcp_client.py        # MCP protocol implementation
-│   │   └── stategraph_orchestrator.py  # A2A coordination
+│   │   ├── slim_client.py       # SLIM transport client (A2A over gRPC)
+│   │   └── stategraph_orchestrator.py  # A2A coordination via SLIM
 │   │
 │   ├── agents/                  # A2A specialized agents
-│   │   ├── alerts/main.py       # Service alerts & delays
-│   │   ├── planner/main.py      # Trip planning & routing
-│   │   └── stopfinder/main.py   # Station/stop search
+│   │   ├── alerts/
+│   │   │   ├── main.py          # HTTP A2A server (port 8001)
+│   │   │   └── slim_wrapper.py  # SLIM A2A server (port 50051)
+│   │   ├── planner/
+│   │   │   ├── main.py          # HTTP A2A server (port 8002)
+│   │   │   └── slim_wrapper.py  # SLIM A2A server (port 50052)
+│   │   └── stopfinder/
+│   │       ├── main.py          # HTTP A2A server (port 8003)
+│   │       └── slim_wrapper.py  # SLIM A2A server (port 50053)
 │   │
 │   ├── frontend/                # Web UI
 │   │   ├── chat_server.py       # WebSocket server
@@ -502,9 +627,9 @@ mbta-agentcy/
 ├── docker/
 │   └── otel-collector-config.yaml  # Telemetry routing config
 │
-├── deploy-agents-only.sh        # Deploy agents server
-├── deploy-exchange-only.sh      # Deploy exchange server
-├── deploy-observability.sh      # Deploy observability server
+├── deploy-agents-only.sh        # Deploy agents with SLIM
+├── deploy-exchange-only.sh      # Deploy exchange with SLIM client
+├── deploy-observability.sh      # Deploy observability
 ├── deploy_registry_with_ui.sh   # Deploy NANDA registry
 ├── register_agents.sh           # Register agents in registry
 ├── registry-ui.html             # Registry dashboard
@@ -519,16 +644,19 @@ mbta-agentcy/
 ### Protocols & Frameworks
 - **MCP** - Anthropic's Model Context Protocol (stdio transport)
 - **A2A** - NANDA/Google Agent-to-Agent protocol (HTTP/JSON)
+- **SLIM** - Cisco transport for A2A over gRPC (binary, efficient)
 - **HTTPS/TLS** - Secure transport between services
 
 ### Core Technologies
-- **Python 3.11** - Primary language
+- **Python 3.12** - Primary language
 - **FastAPI** - Web framework for all services
 - **LangGraph** - Multi-agent orchestration
 - **OpenAI GPT-4o-mini** - Classification, routing, synthesis
+- **agntcy-app-sdk** - SLIM client factory
+- **a2a-sdk** - A2A server and types
 
 ### Observability
-- **OpenTelemetry** - Distributed tracing standard
+- **OpenTelemetry** - Distributed tracing standard (OTLP over gRPC)
 - **Jaeger** - Trace visualization
 - **Grafana** - Metrics dashboards
 - **ClickHouse** - Time-series analytics
@@ -539,7 +667,7 @@ mbta-agentcy/
 - **Supervisor** - Process management for agents/exchange
 - **Nginx** - Web server for registry UI
 
-
+---
 
 ## 🔐 **Security Considerations**
 
@@ -548,11 +676,12 @@ mbta-agentcy/
 ✅ **API key authentication** for OpenAI/MBTA
 ✅ **Cloud firewall** rules restricting ports
 ✅ **SSH key-only** access (no password login)
+✅ **SLIM transport** isolated on internal ports (50051-50053)
 
 ### Production Hardening Needed
-⏭️ Mutual TLS (mTLS) for service-to-service auth
+⏭️ Mutual TLS (mTLS) for SLIM gRPC connections
 ⏭️ W3C Verifiable Credentials (NANDA spec)
-⏭️ Ed25519 cryptographic signing
+⏭️ Ed25519 cryptographic signing for agents
 ⏭️ Zero Trust Agentic Access (ZTAA) framework
 ⏭️ Secrets management (Vault/AWS Secrets Manager)
 
@@ -560,16 +689,13 @@ mbta-agentcy/
 
 ---
 
-
-
-
-
 ## 🔗 **Quick Links**
 
 - **NANDA Project:** https://nanda.media.mit.edu/
 - **AGNTCY Docs:** https://docs.agntcy.org/
 - **MCP Specification:** https://modelcontextprotocol.io/
 - **A2A Protocol:** https://github.com/google/a2a
+- **SLIM Transport:** https://github.com/cisco-open/agentcy
 
 ---
 
@@ -587,7 +713,16 @@ bash register_agents.sh
 curl http://EXCHANGE_IP:8100/
 curl -X POST http://EXCHANGE_IP:8100/chat -d '{"query":"Red Line delays?"}'
 
-# View traces
+# Test SLIM agents directly
+curl http://AGENTS_IP:50051/.well-known/agent-card.json
+curl http://AGENTS_IP:50052/.well-known/agent-card.json
+curl http://AGENTS_IP:50053/.well-known/agent-card.json
+
+# Check SLIM services running
+ssh -i mbta-agents-key root@AGENTS_IP
+sudo supervisorctl status | grep slim
+
+# View traces (including SLIM spans)
 # Open: http://OBSERVABILITY_IP:16686
 
 # Access UI
@@ -604,3 +739,12 @@ linode-cli linodes list
 linode-cli linodes delete <INSTANCE_ID>
 ```
 
+---
+
+## 📖 **Documentation Files**
+
+For deeper understanding of the system:
+- **SLIM_and_AGNTCY_SDK_Explained.md** - Detailed explanation of SLIM transport and SDK usage
+- **Architecture Diagrams** - Visual representation of protocol flows
+- **Performance Analysis** - Benchmarks and latency breakdowns
+- **Protocol Comparison** - MCP vs A2A vs SLIM characteristics
