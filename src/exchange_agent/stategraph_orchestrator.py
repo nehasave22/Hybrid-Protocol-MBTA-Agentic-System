@@ -1,10 +1,9 @@
 """
 StateGraph-based Orchestrator for MBTA Agntcy
-SEMANTIC AGENT DISCOVERY: LLM matches queries to agent descriptions
-NO HARDCODED CAPABILITIES - Purely natural language matching
+SEMANTIC AGENT DISCOVERY + QUERY DECOMPOSITION + SLIM TRANSPORT
 """
 import os
-from typing import TypedDict, Annotated, Sequence, Literal
+from typing import TypedDict, Annotated, Sequence, Literal, Dict
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 import operator
@@ -18,19 +17,24 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 import json
 
+# Import SLIM client
+try:
+    from .slim_client import SlimAgentClient
+    SLIM_AVAILABLE = True
+except ImportError:
+    SLIM_AVAILABLE = False
+
 tracer = trace.get_tracer(__name__)
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Registry configuration
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://23.92.17.180:6900")
 
 # Discovery cache
 _agent_catalog_cache = None
 _catalog_cache_time = None
-_catalog_cache_ttl = timedelta(minutes=5)  # Refresh agent catalog every 5 minutes
+_catalog_cache_ttl = timedelta(minutes=5)
+_current_orchestrator = None
 
 
 # ============================================================================
@@ -39,31 +43,19 @@ _catalog_cache_ttl = timedelta(minutes=5)  # Refresh agent catalog every 5 minut
 
 class AgentState(TypedDict):
     """The state that flows through the StateGraph"""
-    # Input
     user_message: str
     conversation_id: str
     intent: str
     confidence: float
-    
-    # Agent selection (discovered semantically)
-    matched_agents: list[str]  # Agent IDs discovered by semantic matching
-    
-    # Agent execution tracking
+    matched_agents: list[str]
+    agent_queries: Dict[str, str]  # NEW: Decomposed queries per agent
     messages: Annotated[Sequence[BaseMessage], operator.add]
     agents_called: list[str]
     agent_responses: list[dict]
-    
-    # Final output
     final_response: str
     should_end: bool
-    
-    # LLM decision metadata
     llm_matching_decision: dict | None
 
-
-# ============================================================================
-# AGENT CONFIGURATION
-# ============================================================================
 
 @dataclass
 class AgentConfig:
@@ -71,12 +63,15 @@ class AgentConfig:
     url: str
     port: int
     description: str
-    capabilities: list[str]  # Optional, for backward compatibility
+    capabilities: list[str]
     discovered_from_registry: bool = True
 
 
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 async def validate_registry_connection() -> bool:
-    """Validate that registry is accessible."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{REGISTRY_URL}/health")
@@ -87,82 +82,44 @@ async def validate_registry_connection() -> bool:
 
 
 async def get_agent_catalog_from_registry() -> list[dict]:
-    """
-    Get ALL registered agents with their descriptions from registry.
-    This is cached for 5 minutes to reduce registry load.
-    
-    Returns:
-        List of agent info dicts with descriptions:
-        [
-            {
-                "agent_id": "mbta-alerts",
-                "agent_url": "http://96.126.111.107:8001",
-                "description": "Provides real-time service alerts...",
-                "capabilities": ["alerts"],  # Optional
-                "alive": true
-            },
-            ...
-        ]
-    """
     global _agent_catalog_cache, _catalog_cache_time
     
-    # Check cache
     if _agent_catalog_cache and _catalog_cache_time:
-        cache_age = (datetime.now() - _catalog_cache_time).total_seconds()
         if datetime.now() - _catalog_cache_time < _catalog_cache_ttl:
-            logger.info(f"💾 Agent catalog cache hit ({len(_agent_catalog_cache)} agents, age: {cache_age:.1f}s)")
             return _agent_catalog_cache
-        else:
-            logger.info(f"🔄 Agent catalog cache expired, refreshing...")
-    
-    logger.info("🔍 Fetching agent catalog from registry...")
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Get all agent IDs
             response = await client.get(f"{REGISTRY_URL}/list")
             response.raise_for_status()
             agent_list = response.json()
             
-            # Get detailed info for each agent
             agents_info = []
             for agent_id in agent_list.keys():
                 if agent_id == 'agent_status':
                     continue
                 
                 try:
-                    # Get full agent details
                     agent_response = await client.get(f"{REGISTRY_URL}/agents/{agent_id}")
                     if agent_response.status_code != 200:
                         continue
                     
                     agent_data = agent_response.json()
-                    
-                    # Only include alive agents
                     if not agent_data.get("alive"):
-                        logger.debug(f"Skipping {agent_id} (not alive)")
                         continue
                     
                     agents_info.append({
                         "agent_id": agent_data.get("agent_id"),
                         "agent_url": agent_data.get("agent_url"),
-                        "description": agent_data.get("description", "No description available"),
+                        "description": agent_data.get("description", ""),
                         "capabilities": agent_data.get("capabilities", []),
                         "alive": agent_data.get("alive", False)
                     })
-                    
                 except Exception as e:
-                    logger.warning(f"⚠️  Could not get details for {agent_id}: {e}")
                     continue
             
-            # Cache the catalog
             _agent_catalog_cache = agents_info
             _catalog_cache_time = datetime.now()
-            
-            logger.info(f"✅ Agent catalog loaded: {len(agents_info)} alive agents")
-            for agent in agents_info:
-                logger.info(f"   • {agent['agent_id']}: {agent['description'][:60]}...")
-            
             return agents_info
             
     except Exception as e:
@@ -171,109 +128,47 @@ async def get_agent_catalog_from_registry() -> list[dict]:
 
 
 async def semantic_agent_discovery(query: str) -> list[AgentConfig]:
-    """
-    SEMANTIC DISCOVERY: LLM matches query to agent descriptions.
-    
-    
-    Args:
-        query: User's natural language query
-        
-    Returns:
-        List of matched agents (ordered by relevance)
-    """
-    
-    with tracer.start_as_current_span("semantic_agent_discovery") as span:
-        span.set_attribute("query", query)
-        
-        # Get all available agents with descriptions
+    with tracer.start_as_current_span("semantic_agent_discovery"):
         agent_catalog = await get_agent_catalog_from_registry()
-        
         if not agent_catalog:
-            logger.warning("⚠️  No agents available in registry")
             return []
         
-        # Build agent catalog text for LLM
-        agent_descriptions = []
-        for agent in agent_catalog:
-            agent_descriptions.append(
-                f"• {agent['agent_id']}: {agent['description']}"
-            )
-        
+        agent_descriptions = [f"• {a['agent_id']}: {a['description']}" for a in agent_catalog]
         catalog_text = "\n".join(agent_descriptions)
         
-        # Ask LLM to semantically match query to descriptions
-        prompt = f"""You are an intelligent agent router that matches user queries to available agents using semantic understanding.
+        prompt = f"""Match user query to available agents.
 
 User Query: "{query}"
 
-Available Agents (each with natural language description):
+Available Agents:
 {catalog_text}
 
-Your Task:
-1. Read and understand what the user is asking for
-2. Read ALL agent descriptions carefully
-3. Identify which agent(s) can best handle this query based on their descriptions
-4. Consider semantic meaning, not just keyword matching
-5. You can select multiple agents if the query needs multiple capabilities
-6. Return agent IDs in order of relevance (most relevant first)
-
-Examples of good semantic matching:
-- Query: "Are there delays?" → Agent describing "real-time service alerts" ✓
-- Query: "Find stops near me" → Agent describing "location-based stop search" ✓
-- Query: "Bike route avoiding hills" → Agent mentioning "elevation-aware cycling routes" ✓
-- Query: "How do I get to Harvard?" → Agent describing "route planning and directions" ✓
-
-Return ONLY valid JSON:
+Return JSON:
 {{
-  "matched_agents": ["agent_id_1", "agent_id_2"],
-  "reasoning": "Brief explanation of semantic match",
+  "matched_agents": ["agent_id_1"],
+  "reasoning": "explanation",
   "confidence": 0.9
 }}
-
-If NO agents match the query semantically, return empty list.
 """
-
+        
         try:
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are an expert at semantic matching. Carefully read descriptions and match based on meaning, not just keywords. Return ONLY valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=400,
                 response_format={"type": "json_object"}
             )
             
-            result_text = response.choices[0].message.content.strip()
-            result = json.loads(result_text)
-            
+            result = json.loads(response.choices[0].message.content)
             matched_agent_ids = result.get("matched_agents", [])
-            reasoning = result.get("reasoning", "No reasoning provided")
-            confidence = result.get("confidence", 0.5)
             
-            logger.info(f"🤖 Semantic Agent Matching:")
-            logger.info(f"   Query: {query[:60]}...")
-            logger.info(f"   Matched: {', '.join(matched_agent_ids) if matched_agent_ids else 'None'}")
-            logger.info(f"   Reasoning: {reasoning}")
-            logger.info(f"   Confidence: {confidence:.2f}")
-            
-            span.set_attribute("matched_agents", ",".join(matched_agent_ids))
-            span.set_attribute("match_confidence", confidence)
-            
-            # Convert matched IDs to AgentConfig objects
             matched_configs = []
             for agent_id in matched_agent_ids:
-                # Find agent in catalog
                 agent_info = next((a for a in agent_catalog if a['agent_id'] == agent_id), None)
-                
                 if not agent_info:
-                    logger.warning(f"⚠️  Matched agent {agent_id} not found in catalog")
                     continue
                 
-                # Parse URL
                 parsed = urlparse(agent_info['agent_url'])
-                
                 config = AgentConfig(
                     name=agent_info['agent_id'],
                     url=f"{parsed.scheme or 'http'}://{parsed.hostname}",
@@ -282,94 +177,50 @@ If NO agents match the query semantically, return empty list.
                     capabilities=agent_info.get('capabilities', []),
                     discovered_from_registry=True
                 )
-                
                 matched_configs.append(config)
-                logger.info(f"✅ Matched: {config.name} → {config.url}:{config.port}")
             
             return matched_configs
-            
         except Exception as e:
             logger.error(f"❌ Semantic matching failed: {e}")
             return []
 
 
-async def call_agent_api(agent_config: AgentConfig, message: str, conversation_id: str) -> dict:
-    """
-    Call an agent via A2A protocol.
+async def call_agent_via_slim(slim_client, agent_config: AgentConfig, message: str) -> dict:
+    agent_map = {
+        "mbta-alerts": "alerts",
+        "mbta-route-planner": "planner",
+        "mbta-stops": "stopfinder",
+        "mbta-planner": "planner",
+        "mbta-stopfinder": "stopfinder"
+    }
     
-    Args:
-        agent_config: Agent configuration (discovered semantically)
-        message: Message to send to agent
-        conversation_id: Conversation ID for tracking
-        
-    Returns:
-        Agent response or error dict
-    """
+    slim_name = agent_map.get(agent_config.name)
+    if not slim_name:
+        raise ValueError(f"Agent {agent_config.name} not mapped")
     
+    return await slim_client.call_agent(slim_name, message)
+
+
+async def call_agent_via_http(agent_config: AgentConfig, message: str, conversation_id: str) -> dict:
     url = f"{agent_config.url}:{agent_config.port}/a2a/message"
     
     payload = {
         "type": "request",
-        "payload": {
-            "message": message,
-            "conversation_id": conversation_id
-        },
-        "metadata": {
-            "source": "stategraph-orchestrator",
-            "agent_name": agent_config.name,
-            "discovered_via": "semantic-description-matching"
-        }
+        "payload": {"message": message, "conversation_id": conversation_id},
+        "metadata": {"source": "stategraph", "agent_name": agent_config.name}
     }
     
-    # Add HTTP call span
-    with tracer.start_as_current_span(
-        f"http_post: {agent_config.name}",
-        attributes={
-            "http.method": "POST",
-            "http.url": url,
-            "http.target": "/a2a/message"
-        }
-    ) as http_span:
-        logger.info(f"📞 Calling {agent_config.name} at {url}")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        result = response.json()
         
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(url, json=payload)
-                
-                http_span.set_attribute("http.status_code", response.status_code)
-                
-                response.raise_for_status()
-                result = response.json()
-                
-                # Extract response from A2A envelope
-                if result.get("type") == "response" and "payload" in result:
-                    response_text = result["payload"].get("text", "")
-                    logger.info(f"📥 Response from {agent_config.name}: {len(response_text)} chars")
-                    
-                    http_span.set_attribute("response.text.length", len(response_text))
-                    
-                    return {
-                        "response": response_text,
-                        "payload": result["payload"],
-                        "agent_used": agent_config.name,
-                        "agent_description": agent_config.description
-                    }
-                
-                return result
-                
-        except httpx.HTTPError as e:
-            error_msg = f"Agent API call failed for {agent_config.name}: {e}"
-            logger.error(f"❌ {error_msg}")
-            
-            http_span.set_attribute("error", True)
-            http_span.set_attribute("error.message", str(e))
-            http_span.record_exception(e)
-            
+        if result.get("type") == "response" and "payload" in result:
             return {
-                "response": f"Error calling agent {agent_config.name}: {e}",
-                "error": True,
-                "agent_attempted": agent_config.name
+                "response": result["payload"].get("text", ""),
+                "agent_used": agent_config.name
             }
+        return result
 
 
 # ============================================================================
@@ -377,102 +228,142 @@ async def call_agent_api(agent_config: AgentConfig, message: str, conversation_i
 # ============================================================================
 
 async def semantic_discovery_node(state: AgentState) -> AgentState:
-    """
-    Use LLM to semantically match query to agent descriptions.
-    This is the CORE INNOVATION of the system!
-    """
-    with tracer.start_as_current_span("semantic_discovery_node") as span:
-        span.set_attribute("user_message", state["user_message"])
-        
-        # Semantic agent discovery
+    """Match query to agents"""
+    with tracer.start_as_current_span("semantic_discovery"):
         matched_agents = await semantic_agent_discovery(state["user_message"])
-        
-        # Extract just the agent IDs
         matched_agent_ids = [agent.name for agent in matched_agents]
         
-        # Determine intent based on what was matched
         intent = "general"
         confidence = 0.5
         
         if matched_agent_ids:
-            # Infer intent from first matched agent's description
             first_agent = matched_agents[0]
-            desc_lower = first_agent.description.lower()
+            desc = first_agent.description.lower()
             
-            if any(word in desc_lower for word in ["alert", "delay", "disruption"]):
-                intent = "alerts"
-                confidence = 0.85
-            elif any(word in desc_lower for word in ["stop", "station", "location"]):
-                intent = "stops"
-                confidence = 0.85
-            elif any(word in desc_lower for word in ["route", "planning", "direction", "trip"]):
-                intent = "trip_planning"
-                confidence = 0.85
-            else:
-                intent = "transit_info"
-                confidence = 0.75
-        
-        logger.info(f"🎯 Semantic Discovery Result:")
-        logger.info(f"   Matched: {', '.join(matched_agent_ids) if matched_agent_ids else 'None'}")
-        logger.info(f"   Inferred Intent: {intent} (confidence: {confidence:.2f})")
-        
-        span.set_attribute("matched_agents", ",".join(matched_agent_ids))
-        span.set_attribute("intent", intent)
-        span.set_attribute("confidence", confidence)
+            if any(w in desc for w in ["alert", "delay"]):
+                intent, confidence = "alerts", 0.85
+            elif any(w in desc for w in ["stop", "station"]):
+                intent, confidence = "stops", 0.85
+            elif any(w in desc for w in ["route", "planning"]):
+                intent, confidence = "trip_planning", 0.85
         
         return {
             **state,
             "matched_agents": matched_agent_ids,
             "intent": intent,
             "confidence": confidence,
+            "agent_queries": {},  # Will be filled by decomposition node
             "agent_responses": [],
             "agents_called": [],
             "messages": [HumanMessage(content=state["user_message"])],
-            "llm_matching_decision": {
-                "matched_agents": matched_agent_ids,
-                "agent_configs": [
-                    {"name": a.name, "description": a.description} 
-                    for a in matched_agents
-                ]
-            }
+            "llm_matching_decision": {"matched_agents": matched_agent_ids}
         }
 
 
-async def execute_agents_node(state: AgentState) -> AgentState:
+async def query_decomposition_node(state: AgentState) -> AgentState:
     """
-    Execute all matched agents sequentially.
-    Collects responses from each agent.
+    NEW NODE: Decompose complex queries into agent-specific sub-queries
     """
-    with tracer.start_as_current_span("execute_agents_node") as span:
-        matched_agent_ids = state.get("matched_agents", [])
+    with tracer.start_as_current_span("query_decomposition") as span:
+        matched_agents = state.get("matched_agents", [])
+        user_message = state["user_message"]
         
-        if not matched_agent_ids:
-            logger.info("ℹ️  No agents matched - will handle as general query")
+        # If only 1 agent or no agents, no decomposition needed
+        if len(matched_agents) <= 1:
+            logger.info("ℹ️  Single agent query - no decomposition needed")
+            return {**state, "agent_queries": {}}
+        
+        logger.info(f"🔧 Decomposing query for {len(matched_agents)} agents")
+        
+        # Get agent catalog for descriptions
+        agent_catalog = await get_agent_catalog_from_registry()
+        
+        # Build agent context
+        agent_context = []
+        for agent_id in matched_agents:
+            agent_info = next((a for a in agent_catalog if a['agent_id'] == agent_id), None)
+            if agent_info:
+                agent_context.append(f"• {agent_id}: {agent_info['description']}")
+        
+        context_text = "\n".join(agent_context)
+        
+        # Decompose with LLM
+        prompt = f"""You are decomposing a complex user query for multiple specialized agents.
+
+Original User Query: "{user_message}"
+
+Matched Agents and their capabilities:
+{context_text}
+
+Your Task:
+For EACH matched agent, extract ONLY the relevant sub-question from the original query.
+Make each sub-query standalone and focused on that agent's capabilities.
+
+Examples:
+- Original: "Check delays then find MIT station"
+  - mbta-alerts: "Are there any service delays?"
+  - mbta-stopfinder: "Find MIT station"
+
+- Original: "I need to get from Park St to Harvard. Are there delays?"
+  - mbta-planner: "Route from Park Street to Harvard"
+  - mbta-alerts: "Are there any delays?"
+
+Return ONLY valid JSON mapping agent IDs to their specific queries:
+{{
+  "agent-id-1": "specific focused query for this agent",
+  "agent-id-2": "specific focused query for that agent"
+}}
+
+Keep queries concise and focused. If the original query doesn't have a relevant part for an agent, use the agent's description to infer what would be helpful.
+"""
+
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=300,
+                response_format={"type": "json_object"}
+            )
+            
+            agent_queries = json.loads(response.choices[0].message.content)
+            
+            logger.info(f"✅ Query decomposed:")
+            for agent_id, query in agent_queries.items():
+                logger.info(f"   • {agent_id}: '{query}'")
+            
+            span.set_attribute("decomposed_queries", json.dumps(agent_queries))
+            
             return {
                 **state,
-                "agents_called": [],
-                "agent_responses": []
+                "agent_queries": agent_queries
             }
+            
+        except Exception as e:
+            logger.error(f"❌ Query decomposition failed: {e}")
+            # Fallback: use original query for all
+            return {**state, "agent_queries": {}}
+
+
+async def execute_agents_node(state: AgentState) -> AgentState:
+    """Execute agents with decomposed queries"""
+    with tracer.start_as_current_span("execute_agents"):
+        matched_agent_ids = state.get("matched_agents", [])
+        if not matched_agent_ids:
+            return {**state, "agents_called": [], "agent_responses": []}
         
-        logger.info(f"🔄 Executing {len(matched_agent_ids)} matched agent(s)")
-        span.set_attribute("agents.to_execute", len(matched_agent_ids))
-        span.set_attribute("agent_ids", json.dumps(matched_agent_ids))
-        
-        # Get fresh agent catalog to get AgentConfig objects
+        global _current_orchestrator
         agent_catalog = await get_agent_catalog_from_registry()
+        agent_queries = state.get("agent_queries", {})
         
         responses = []
         agents_called = []
         
         for agent_id in matched_agent_ids:
-            # Find agent in catalog
             agent_info = next((a for a in agent_catalog if a['agent_id'] == agent_id), None)
-            
             if not agent_info:
-                logger.warning(f"⚠️  Agent {agent_id} not found in catalog")
                 continue
             
-            # Parse URL and create config
             parsed = urlparse(agent_info['agent_url'])
             agent_config = AgentConfig(
                 name=agent_info['agent_id'],
@@ -483,65 +374,57 @@ async def execute_agents_node(state: AgentState) -> AgentState:
                 discovered_from_registry=True
             )
             
-            # CREATE A DEDICATED SPAN FOR THIS SPECIFIC AGENT
-            with tracer.start_as_current_span(
-                f"agent: {agent_id}",  # This will show clearly in Jaeger!
-                attributes={
-                    "agent.id": agent_id,
-                    "agent.name": agent_config.name,
-                    "agent.url": f"{agent_config.url}:{agent_config.port}",
-                    "agent.description": agent_info['description'][:100],
-                    "agent.type": "a2a",
-                    "query": state["user_message"]
-                }
-            ) as agent_span:
+            # Use decomposed query if available, otherwise full query
+            agent_specific_query = agent_queries.get(agent_id, state["user_message"])
+            
+            logger.info(f"📞 Calling {agent_id} with: '{agent_specific_query[:60]}...'")
+            
+            with tracer.start_as_current_span(f"agent: {agent_id}") as agent_span:
                 try:
-                    logger.info(f"📞 Calling agent {agent_id} ({agent_config.description[:40]}...)")
-                    
-                    # Call the agent
-                    result = await call_agent_api(
-                        agent_config=agent_config,
-                        message=state["user_message"],
-                        conversation_id=state["conversation_id"]
-                    )
-                    
-                    # Mark success/failure
-                    if result.get("error"):
-                        agent_span.set_attribute("agent.status", "error")
-                        agent_span.set_attribute("agent.error", str(result.get("response", "")))
-                        agent_label = f"{agent_id} (failed)"
-                        logger.error(f"❌ Agent {agent_id} failed: {result.get('response')}")
+                    # Try SLIM first
+                    if _current_orchestrator and _current_orchestrator.use_slim and _current_orchestrator.slim_client:
+                        try:
+                            logger.info(f"📡 Calling {agent_id} via SLIM...")
+                            result = await call_agent_via_slim(
+                                _current_orchestrator.slim_client,
+                                agent_config,
+                                agent_specific_query  # ← Using decomposed query!
+                            )
+                            agent_span.set_attribute("transport", "slim")
+                            agent_span.set_attribute("query_decomposed", agent_id in agent_queries)
+                            logger.info(f"✅ SLIM success for {agent_id}")
+                        except Exception as e:
+                            logger.warning(f"⚠️  SLIM failed: {e}")
+                            result = await call_agent_via_http(
+                                agent_config,
+                                agent_specific_query,
+                                state["conversation_id"]
+                            )
+                            agent_span.set_attribute("transport", "http_fallback")
                     else:
-                        agent_span.set_attribute("agent.status", "success")
-                        agent_span.set_attribute("response.length", len(result.get("response", "")))
-                        agent_label = agent_id
-                        logger.info(f"✅ Agent {agent_id} responded successfully")
+                        result = await call_agent_via_http(
+                            agent_config,
+                            agent_specific_query,
+                            state["conversation_id"]
+                        )
+                        agent_span.set_attribute("transport", "http")
                     
+                    agent_label = agent_id if not result.get("error") else f"{agent_id} (failed)"
                     responses.append(result)
                     agents_called.append(agent_label)
                     
                 except Exception as e:
-                    agent_span.set_attribute("agent.status", "exception")
-                    agent_span.set_attribute("agent.error", str(e))
                     agent_span.record_exception(e)
-                    logger.error(f"❌ Exception calling agent {agent_id}: {e}")
-                    
-                    responses.append({
-                        "response": f"Error calling agent {agent_id}: {str(e)}",
-                        "error": True,
-                        "agent_attempted": agent_id
-                    })
+                    logger.error(f"❌ Exception calling {agent_id}: {e}")
+                    responses.append({"response": f"Error: {e}", "error": True})
                     agents_called.append(f"{agent_id} (error)")
-        
-        span.set_attribute("agents.executed", len(agents_called))
-        span.set_attribute("agents.called", json.dumps(agents_called))
         
         return {
             **state,
             "agent_responses": responses,
             "agents_called": agents_called,
             "messages": [
-                AIMessage(content=f"{r.get('agent_used', 'agent')}: {r.get('response', '')[:100]}...", 
+                AIMessage(content=f"{r.get('agent_used', 'agent')}: {r.get('response', '')[:100]}", 
                          name=r.get('agent_used', 'agent'))
                 for r in responses if not r.get('error')
             ]
@@ -549,51 +432,29 @@ async def execute_agents_node(state: AgentState) -> AgentState:
 
 
 async def synthesize_response_node(state: AgentState) -> AgentState:
-    """Synthesize all agent responses into final answer"""
-    with tracer.start_as_current_span("synthesize_response_node"):
-        
-        # Handle general queries (no agents matched)
-        matched_agents = state.get("matched_agents", [])
-        if not matched_agents:
+    """Synthesize final response"""
+    with tracer.start_as_current_span("synthesize"):
+        if not state.get("matched_agents", []):
             message = state["user_message"].lower()
-            
-            if any(word in message for word in ["hi", "hello", "hey", "good morning", "whats up"]):
+            if any(w in message for w in ["hi", "hello", "hey"]):
                 return {
                     **state,
-                    "final_response": "Hello! I'm MBTA Agntcy, your Boston transit assistant. I use semantic agent discovery to connect you with the right transit information. What would you like to know?",
+                    "final_response": "Hello! I'm MBTA Agntcy with SLIM transport. What can I help you with?",
                     "should_end": True
                 }
             else:
                 return {
                     **state,
-                    "final_response": "I'm specialized in Boston MBTA transit information. I couldn't find agents that match your query - could you try asking about:\n• Service alerts and delays\n• Finding stops and stations\n• Planning routes and trips",
+                    "final_response": "I'm specialized in Boston MBTA transit. Try asking about alerts, stops, or routes.",
                     "should_end": True
                 }
         
-        # Collect agent responses
-        responses = []
-        had_errors = False
+        responses = [r.get("response", "") for r in state.get("agent_responses", []) if not r.get("error") and r.get("response")]
         
-        for result in state.get("agent_responses", []):
-            if result.get("error"):
-                had_errors = True
-                continue
-            
-            response_text = result.get("response", "")
-            if response_text and response_text.strip():
-                responses.append(response_text)
-        
-        # Build final response
         if responses:
-            final_response = "\n\n".join(filter(None, responses))
-            
-            if had_errors:
-                final_response += "\n\n⚠️ Note: Some agents were unavailable. Response may be incomplete."
+            final_response = "\n\n".join(responses)
         else:
-            if had_errors:
-                final_response = "I'm sorry, but I'm having trouble connecting to the necessary agents right now. Please try again in a moment."
-            else:
-                final_response = "I received your request but couldn't generate a complete response. Please try rephrasing your question."
+            final_response = "Agents are currently unavailable."
         
         return {
             **state,
@@ -606,16 +467,17 @@ async def synthesize_response_node(state: AgentState) -> AgentState:
 # ROUTING FUNCTIONS
 # ============================================================================
 
-def route_after_discovery(state: AgentState) -> Literal["execute_agents", "synthesize"]:
-    """Route based on whether agents were matched"""
-    matched_agents = state.get("matched_agents", [])
-    
-    if matched_agents:
-        logger.info(f"🤖 Routing to execute {len(matched_agents)} matched agent(s)")
-        return "execute_agents"
+def route_after_discovery(state: AgentState) -> Literal["decompose_query", "synthesize"]:
+    """Route to decomposition if agents matched"""
+    if state.get("matched_agents", []):
+        return "decompose_query"
     else:
-        logger.info(f"🤖 No agents matched - routing to general handler")
         return "synthesize"
+
+
+def route_after_decomposition(state: AgentState) -> Literal["execute_agents"]:
+    """Always execute after decomposition"""
+    return "execute_agents"
 
 
 def route_after_execution(state: AgentState) -> Literal["synthesize"]:
@@ -624,38 +486,39 @@ def route_after_execution(state: AgentState) -> Literal["synthesize"]:
 
 
 # ============================================================================
-# BUILD THE GRAPH
+# BUILD GRAPH
 # ============================================================================
 
 def build_mbta_graph() -> StateGraph:
-    """Build StateGraph with semantic discovery"""
-    
     workflow = StateGraph(AgentState)
     
     # Add nodes
     workflow.add_node("semantic_discovery", semantic_discovery_node)
+    workflow.add_node("decompose_query", query_decomposition_node)  # NEW NODE
     workflow.add_node("execute_agents", execute_agents_node)
     workflow.add_node("synthesize", synthesize_response_node)
     
-    # Set entry point
+    # Entry point
     workflow.set_entry_point("semantic_discovery")
     
-    # Conditional edges
+    # Edges
     workflow.add_conditional_edges(
         "semantic_discovery",
         route_after_discovery,
-        {
-            "execute_agents": "execute_agents",
-            "synthesize": "synthesize"
-        }
+        {"decompose_query": "decompose_query", "synthesize": "synthesize"}
+    )
+    
+    # NEW: Route from decomposition to execution
+    workflow.add_conditional_edges(
+        "decompose_query",
+        route_after_decomposition,
+        {"execute_agents": "execute_agents"}
     )
     
     workflow.add_conditional_edges(
         "execute_agents",
         route_after_execution,
-        {
-            "synthesize": "synthesize"
-        }
+        {"synthesize": "synthesize"}
     )
     
     workflow.add_edge("synthesize", END)
@@ -664,74 +527,58 @@ def build_mbta_graph() -> StateGraph:
 
 
 # ============================================================================
-# MAIN ORCHESTRATOR
+# ORCHESTRATOR
 # ============================================================================
 
 class StateGraphOrchestrator:
-    """
-    LLM-powered multi-agent orchestrator with SEMANTIC DESCRIPTION-BASED discovery.
-    
-    Zero hardcoded capabilities!
-    Zero hardcoded agent names!
-    Pure semantic matching of queries to agent descriptions!
-    """
-    
     def __init__(self):
+        global _current_orchestrator
+        
         logger.info("=" * 80)
-        logger.info("🚀 Initializing StateGraph Orchestrator (SEMANTIC DISCOVERY MODE)")
-        logger.info(f"   Registry URL: {REGISTRY_URL}")
-        logger.info(f"   Catalog Cache TTL: {_catalog_cache_ttl.total_seconds():.0f}s")
-        logger.info(f"   Discovery Method: LLM semantic matching on agent descriptions")
+        logger.info("🚀 StateGraph with Query Decomposition + SLIM")
         logger.info("=" * 80)
         
         self.graph = build_mbta_graph()
-        logger.info("✅ StateGraph initialized (SEMANTIC + REGISTRY-BASED)")
+        
+        self.use_slim = os.getenv("USE_SLIM", "false").lower() == "true"
+        self.slim_client = None
+        
+        if self.use_slim and SLIM_AVAILABLE:
+            self.slim_client = SlimAgentClient()
+            logger.info("✅ SLIM mode enabled")
+        
+        _current_orchestrator = self
+        logger.info("✅ StateGraph initialized")
     
     async def startup_validation(self):
-        """
-        Validate registry connectivity and load initial agent catalog.
-        """
-        logger.info("🔍 Running startup validation...")
+        logger.info("🔍 Startup validation...")
         
-        # Check registry is accessible
-        registry_ok = await validate_registry_connection()
-        if not registry_ok:
-            raise RuntimeError(
-                f"Registry at {REGISTRY_URL} is not accessible. "
-                "Cannot start without registry connectivity."
-            )
-        logger.info(f"✅ Registry is accessible at {REGISTRY_URL}")
+        if not await validate_registry_connection():
+            raise RuntimeError(f"Registry at {REGISTRY_URL} not accessible")
         
-        # Load agent catalog (will be cached)
         agent_catalog = await get_agent_catalog_from_registry()
+        if agent_catalog:
+            logger.info(f"📚 {len(agent_catalog)} agents registered")
         
-        if not agent_catalog:
-            logger.warning("⚠️  Warning: No agents currently registered in registry")
-            logger.warning("   System will start but queries will fail until agents are registered")
-        else:
-            logger.info(f"📚 Agent Catalog Loaded:")
-            for agent in agent_catalog:
-                logger.info(f"   ✅ {agent['agent_id']}")
-                logger.info(f"      Description: {agent['description'][:70]}...")
-                logger.info(f"      Endpoint: {agent['agent_url']}")
+        if self.use_slim and self.slim_client:
+            try:
+                await self.slim_client.initialize()
+                logger.info("✅ SLIM client initialized")
+            except Exception as e:
+                logger.warning(f"⚠️  SLIM init failed: {e}")
+                self.use_slim = False
         
-        logger.info("=" * 80)
-        logger.info("✅ Startup validation complete")
-        logger.info("🎯 System ready - agents will be discovered via semantic matching")
-        logger.info("=" * 80)
+        logger.info("✅ Startup complete")
     
     async def process_message(self, user_message: str, conversation_id: str) -> dict:
-        """Process message through semantic discovery StateGraph"""
-        with tracer.start_as_current_span("stategraph_orchestrator") as span:
-            span.set_attribute("conversation_id", conversation_id)
-            span.set_attribute("discovery_mode", "semantic-description-based")
-            
+        with tracer.start_as_current_span("stategraph"):
             initial_state: AgentState = {
                 "user_message": user_message,
                 "conversation_id": conversation_id,
                 "intent": "",
                 "confidence": 0.0,
                 "matched_agents": [],
+                "agent_queries": {},
                 "messages": [],
                 "agents_called": [],
                 "agent_responses": [],
@@ -742,10 +589,6 @@ class StateGraphOrchestrator:
             
             final_state = await self.graph.ainvoke(initial_state)
             
-            span.set_attribute("intent", final_state["intent"])
-            span.set_attribute("matched_agents", ",".join(final_state.get("matched_agents", [])))
-            span.set_attribute("agents_called", ",".join(final_state["agents_called"]))
-            
             return {
                 "response": final_state["final_response"],
                 "intent": final_state["intent"],
@@ -754,59 +597,9 @@ class StateGraphOrchestrator:
                 "agents_called": final_state["agents_called"],
                 "metadata": {
                     "conversation_id": conversation_id,
-                    "graph_execution": "completed",
-                    "llm_matching": final_state.get("llm_matching_decision"),
-                    "discovery": "semantic-description-based",
+                    "discovery": "semantic",
+                    "transport": "slim" if self.use_slim else "http",
+                    "query_decomposition": final_state.get("agent_queries", {}),
                     "registry_url": REGISTRY_URL
                 }
             }
-
-
-# ============================================================================
-# EXAMPLE USAGE & TESTING
-# ============================================================================
-
-async def main():
-    """Test semantic discovery orchestrator"""
-    
-    logger.info("🧪 Testing MBTA StateGraph Orchestrator (Semantic Discovery)")
-    
-    try:
-        orchestrator = StateGraphOrchestrator()
-        
-        # Run startup validation
-        await orchestrator.startup_validation()
-        
-        # Test queries with semantic matching
-        test_queries = [
-            "Red Line delays?",  # Should match agent describing "alerts"
-            "How do I get to Harvard?",  # Should match agent describing "route planning"
-            "Find stops near me",  # Should match agent describing "stop search"
-            "Bike route avoiding steep hills",  # Would match bike agent if registered
-        ]
-        
-        for query in test_queries:
-            print(f"\n{'='*70}")
-            print(f"Query: {query}")
-            print('='*70)
-            
-            result = await orchestrator.process_message(query, f"test-{hash(query)}")
-            
-            print(f"\n✅ Intent: {result['intent']} (confidence: {result['confidence']:.2f})")
-            print(f"🎯 Matched Agents: {', '.join(result['matched_agents'])}")
-            print(f"📞 Agents Called: {', '.join(result['agents_called'])}")
-            print(f"🔍 Discovery: {result['metadata'].get('discovery')}")
-            print(f"\n💬 Response:\n{result['response'][:200]}...")
-    
-    except RuntimeError as e:
-        logger.error(f"❌ Startup failed: {e}")
-
-
-if __name__ == "__main__":
-    # Set up basic logging for testing
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    asyncio.run(main())
